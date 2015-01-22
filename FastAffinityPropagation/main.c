@@ -265,7 +265,7 @@ void availability_lower(AffinityPropagation *ap) {
   }
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -317,7 +317,7 @@ void responsibility_upper(AffinityPropagation *ap) {
   free(AS);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -372,7 +372,7 @@ void availability_upper(AffinityPropagation *ap) {
   free(Rp);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -392,7 +392,7 @@ void similarity_sort(AffinityPropagation *ap) {
   }
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -409,8 +409,9 @@ void AffinityPropagation_initBound(AffinityPropagation *ap) {
   availability_lower(ap);
   responsibility_upper(ap);
   availability_upper(ap);
+
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -434,25 +435,12 @@ void AffinityPropagation_link(AffinityPropagation *ap) {
   }
 
   for (int i = 0; i < ap->N; i++) {
-
-    int i0 = i * ap->N;
-
     for (int j = i + 1; j < ap->N; j++) {
       int ij = i * ap->N + j;
       int ji = j * ap->N + i;
-
-      double au_ij = ap->_Au[ij];
-      double s_ij = ap->similarity[ij];
-      double al_ij = ap->_Al[ij];
-      double alsmax = ap->_al_s_sorted[i0];
-
-      if (dcmp(alsmax, al_ij + s_ij) == 0) {
-        alsmax = ap->_al_s_sorted[i0 + 1];
-      }
-
-      if (dcmp(ap->_Ru[ij], 0.0) >= 0 || dcmp(au_ij + s_ij, alsmax) >= 0) {
-        ap->_edges[ij] = true;
-        ap->_edges[ji] = true;
+      if (dcmp(ap->_Ru[ij], 0.0) >= 0 ||
+          dcmp(ap->_Ru[ij] + ap->_Au[ij], 0.0) >= 0) {
+        ap->_edges[ij] = ap->_edges[ji] = true;
       }
     }
   }
@@ -467,7 +455,7 @@ void AffinityPropagation_link(AffinityPropagation *ap) {
   }
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -565,7 +553,7 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
   free(mat);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 const double *AffinityPropagation_RA(AffinityPropagation *ap) {
@@ -578,7 +566,7 @@ const double *AffinityPropagation_RA(AffinityPropagation *ap) {
   cblas_daxpy(N2, 1.0, ap->A, 1, RA, 1);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
   return RA;
 }
 
@@ -631,7 +619,7 @@ void AffinityPropagation_compute_unlinked(AffinityPropagation *ap,
   }
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 /**
@@ -666,7 +654,7 @@ void AffinityPropagation_exemplar(AffinityPropagation *ap, const double *RA) {
   ap->ncluster = counter;
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 double *pairwise_distance_matrix(double *points, int npoint, int dim,
@@ -710,15 +698,15 @@ void AffinityPropagation_fit(AffinityPropagation *ap) {
 
   AffinityPropagation_initBound(ap);
   AffinityPropagation_link(ap);
-  AffinityPropagation_update_linked(ap);
-
-  const double *RA = AffinityPropagation_RA(ap);
-  AffinityPropagation_compute_unlinked(ap, RA);
-  AffinityPropagation_exemplar(ap, RA);
-  free((double *)RA);
+  //  AffinityPropagation_update_linked(ap);
+  //
+  //  const double *RA = AffinityPropagation_RA(ap);
+  //  AffinityPropagation_compute_unlinked(ap, RA);
+  //  AffinityPropagation_exemplar(ap, RA);
+  //  free((double *)RA);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
-  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
 
 double *Matrix_load(const char *filename, unsigned int row, unsigned int col) {
