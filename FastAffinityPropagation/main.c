@@ -15,12 +15,7 @@
 #include <Accelerate/Accelerate.h>
 #include "utarray.h"
 
-#define ALLOCATE(p, n, type)                                                   \
-  if (p == NULL) {                                                             \
-    p = calloc(sizeof(type), n);                                               \
-  } else {                                                                     \
-    memset(p, 0, sizeof(type) * n);                                            \
-  }
+#define ALLOCATE(p, n, type) (p = calloc(sizeof(type), n));
 
 /**
  * @function dcmp
@@ -279,40 +274,42 @@ void responsibility_upper(AffinityPropagation *ap) {
 
   unsigned int N2 = ap->N * ap->N;
 
-  double *AS = calloc(sizeof(double), N2);
+  double *AS, *Y1, *Y2;
+  int *I;
+
+  ALLOCATE(AS, N2, double);
+  ALLOCATE(I, ap->N, int);
+  ALLOCATE(Y1, ap->N, double);
+  ALLOCATE(Y2, ap->N, double);
+  ALLOCATE(ap->_Ru, N2, double);
+
   cblas_dcopy(N2, ap->similarity, 1, AS, 1);
   cblas_daxpy(N2, 1.0, ap->_Al, 1, AS, 1);
-
-  ALLOCATE(ap->_Ru, N2, double);
   cblas_dcopy(N2, ap->similarity, 1, ap->_Ru, 1);
-
-  int *I = calloc(sizeof(int), ap->N);
-  double *Y = calloc(sizeof(double), ap->N);
-  double *Y2 = calloc(sizeof(double), ap->N);
 
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
     CBLAS_INDEX i1 = cblas_idamax(ap->N, &AS[i0], 1);
     I[i] = i1;
-    Y[i] = AS[i0 + i1];
+    Y1[i] = AS[i0 + i1];
 
     AS[i0 + i1] = -FLT_MAX;
     CBLAS_INDEX i2 = cblas_idamax(ap->N, &AS[i0], 1);
     Y2[i] = AS[i0 + i2];
 
-    AS[i0 + i1] = Y[i];
+    AS[i0 + i1] = Y1[i];
   }
 
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
     for (int j = 0; j < ap->N; j++) {
-      ap->_Ru[i0 + j] -= Y[i];
+      ap->_Ru[i0 + j] -= Y1[i];
     }
     ap->_Ru[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
   }
 
   free(I);
-  free(Y);
+  free(Y1);
   free(Y2);
   free(AS);
 
@@ -473,69 +470,94 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
   unsigned int iter = 0;
   unsigned int N2 = ap->N * ap->N;
 
-  double *rho = NULL;
-  double *alp = NULL;
-  double *mat = NULL;
-  double *max = NULL;
+  double *rho, *alp, *AS, *max, *Y1, *Y2, *Rp, *Rs, *dA;
+  int *I;
+
   ALLOCATE(rho, N2, double);
   ALLOCATE(alp, N2, double);
-  ALLOCATE(mat, N2, double);
+  ALLOCATE(AS, N2, double);
   ALLOCATE(max, ap->N * 2, double);
+  ALLOCATE(I, ap->N, int)
+  ALLOCATE(Y1, ap->N, double);
+  ALLOCATE(Y2, ap->N, double);
+  ALLOCATE(Rp, N2, double);
+  ALLOCATE(Rs, ap->N, double);
+  ALLOCATE(dA, ap->N, double);
 
   while (iter < ap->maxiter) {
 
     // Compute \sum_{i=1,k=1}{a[i,k]+s[i,k]} in equation (2)
-    cblas_dcopy(N2, ap->similarity, 1, mat, 1);
-    cblas_daxpy(N2, 1.0, ap->A, 1, mat, 1);
+    cblas_dcopy(N2, ap->similarity, 1, AS, 1);
+    cblas_daxpy(N2, 1.0, ap->A, 1, AS, 1);
 
-    // Find the first and second largest values of each row
+    // Y1 and Y2 are the first and second largest values for each row in AS.
     for (int i = 0; i < ap->N; i++) {
       int i0 = i * ap->N;
-      CBLAS_INDEX imax1 = cblas_idamax(ap->N, &mat[i0], 1);
-      max[i * 2 + 0] = mat[i0 + imax1];
-      mat[i0 + imax1] = -FLT_MAX;
-      CBLAS_INDEX imax2 = cblas_idamax(ap->N, &mat[i0], 1);
-      max[i * 2 + 1] = mat[i0 + imax2];
-      mat[i0 + imax1] = max[i * 2 + 0];
+      CBLAS_INDEX i1 = cblas_idamax(ap->N, &AS[i0], 1);
+      I[i] = i1;
+      Y1[i] = AS[i0 + i1];
+
+      AS[i0 + i1] = -FLT_MAX;
+      CBLAS_INDEX i2 = cblas_idamax(ap->N, &AS[i0], 1);
+      Y2[i] = AS[i0 + i2];
+
+      AS[i0 + i1] = Y1[i];
     }
 
-    // Update the responsibility and availability for each linked data point
-    // pair [i,j].
+    // Update the responsibility of the linked data point pairs.
+    cblas_dcopy(N2, ap->similarity, 1, rho, 1);
+    int k = 0;
     for (int i = 0; i < ap->N; i++) {
-
       int i0 = i * ap->N;
-
       for (int j = 0; j < ap->N; j++) {
-        if (ap->_edges[j] == false) {
-          continue;
+        if (ap->_edges[k]) {
+          rho[k] -= Y1[i];
         }
+        k++;
+      }
+      rho[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
+    }
 
-        int ij = i * ap->N + j;
-        int jj = j * ap->N + j;
-
-        double v = max[i0];
-        if (dcmp(v, ap->A[ij]) == 0) {
-          v = max[i0 + 1];
-        }
-        rho[ij] = ap->similarity[ij] - v;
-
-        v = 0.0;
-        for (int k = 0; k < ap->N; k++) {
-          if (k == i) {
-            continue;
+    // Update the availability of the linked data point pairs.
+    k = 0;
+    for (int i = 0; i < ap->N; i++) {
+      for (int j = 0; j < ap->N; j++) {
+        if (ap->_edges[k]) {
+          if (i == j) {
+            Rp[k] = ap->R[k];
+          } else {
+            Rp[k] = dmax(ap->R[k], 0.0);
           }
-          int kj = k * ap->N + j;
-          double rkj = ap->R[kj];
-          v += dmax(rkj, 0.0);
+          Rs[j] += Rp[k];
         }
+        k++;
+      }
+    }
 
-        if (i == j) {
-          alp[ij] = v;
-        } else {
-          alp[ij] = dmin(0.0, v - dmax(0., ap->R[jj]));
+    cblas_dcopy(N2, Rp, 1, alp, 1);
+    for (int i = 0; i < ap->N; i++) {
+      int i0 = i * ap->N;
+      catlas_daxpby(ap->N, 1.0, Rs, 1, -1.0, &alp[i0], 1);
+      int ii = i0 + i;
+      dA[i] = alp[ii];
+    }
+
+    k = 0;
+    for (int i = 0; i < ap->N; i++) {
+      for (int j = 0; j < ap->N; j++) {
+        if (ap->_edges[k]) {
+          if (i == j) {
+            alp[k] = dA[i];
+          } else {
+            alp[k] = dmin(0.0, alp[k]);
+          }
         }
       }
     }
+
+    catlas_dset(ap->N, 0.0, Rs, 1);
+    catlas_dset(ap->N, 0.0, dA, 1);
+    catlas_dset(N2, 0.0, Rp, 1);
 
     cblas_dscal(N2, ap->damping, ap->R, 1);
     cblas_daxpy(N2, 1.0 - ap->damping, rho, 1, ap->R, 1);
@@ -550,7 +572,6 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
   free(max);
   free(alp);
   free(rho);
-  free(mat);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -698,12 +719,12 @@ void AffinityPropagation_fit(AffinityPropagation *ap) {
 
   AffinityPropagation_initBound(ap);
   AffinityPropagation_link(ap);
-  //  AffinityPropagation_update_linked(ap);
-  //
-  //  const double *RA = AffinityPropagation_RA(ap);
-  //  AffinityPropagation_compute_unlinked(ap, RA);
-  //  AffinityPropagation_exemplar(ap, RA);
-  //  free((double *)RA);
+  AffinityPropagation_update_linked(ap);
+
+  const double *RA = AffinityPropagation_RA(ap);
+  AffinityPropagation_compute_unlinked(ap, RA);
+  AffinityPropagation_exemplar(ap, RA);
+  free((double *)RA);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -771,7 +792,8 @@ int main(int argc, const char *argv[]) {
       "/Users/bismarrck/Documents/Project/FastAffinityPropagation/data.txt",
       1500, 1500);
 
-  AffinityPropagation *ap = AffinityPropagation_init(S, 1500, 5, 5, NULL, true);
+  AffinityPropagation *ap =
+      AffinityPropagation_init(S, 1500, 15, 5, NULL, true);
   AffinityPropagation_fit(ap);
   AffinityPropagation_free(ap);
 
