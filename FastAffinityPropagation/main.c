@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <time.h>
 #include <Accelerate/Accelerate.h>
 #include "utarray.h"
 
@@ -73,91 +75,6 @@ int dcmp_sort_des(const void *a, const void *b) {
 }
 
 typedef struct {
-  int pid;
-  int *edge;
-  int count;
-  int _cap;
-  bool _final;
-} StaticLink;
-
-StaticLink *StaticLink_init(int pid, int *edge, int count) {
-  StaticLink *link = malloc(sizeof(StaticLink));
-  link->pid = pid;
-
-  if (count == 0 || edge == NULL) {
-    link->_cap = 0;
-    link->count = 0;
-    link->edge = NULL;
-    link->_final = false;
-  } else {
-    link->edge = NULL;
-    ALLOCATE(link->edge, count, int);
-    memcpy(link->edge, edge, sizeof(int) * count);
-    link->_cap = count;
-    link->_final = false;
-  }
-
-  return link;
-}
-
-void StaticLink_addEdge(StaticLink *link, int edge) {
-  if (link->_final) {
-    return;
-  }
-  if (link->edge == NULL) {
-    ALLOCATE(link->edge, 10, int);
-    memset(link->edge, -1, sizeof(int) * link->_cap);
-    link->_cap = 10;
-  }
-  if (link->count == link->_cap) {
-    link->_cap += 10;
-    link->edge = realloc(link->edge, sizeof(int) * link->_cap);
-  }
-  link->edge[link->count] = edge;
-  link->count++;
-}
-
-void StaticLink_deleteEdge(StaticLink *link, int edge) {
-  if (link->_final) {
-    return;
-  }
-
-  int k = -1;
-  for (int i = 0; i < link->count; i++) {
-    if (link->edge[i] == edge) {
-      k = i;
-      break;
-    }
-  }
-  if (k == -1) {
-    return;
-  }
-
-  int n = link->count - k - 1;
-  memcpy(&link->edge[k], &link->edge[k + 1], sizeof(int) * n);
-  link->count--;
-  link->edge[link->count - 1] = -1;
-}
-
-void StaticLink_finalize(StaticLink *link) {
-  link->_final = true;
-  if (link->_cap > link->count) {
-    link->edge = realloc(link->edge, sizeof(int) * link->count);
-    link->_cap = link->count;
-  }
-}
-
-void StaticLink_free(StaticLink *link) {
-  if (link == NULL) {
-    return;
-  }
-  if (link->edge) {
-    free(link->edge);
-  }
-  free(link);
-}
-
-typedef struct {
   double *similarity;
   unsigned int N;
   unsigned int maxiter;
@@ -170,9 +87,12 @@ typedef struct {
   double *_r_upper;
   double *_s_sorted;
   double *_al_s_sorted;
+  bool *_edges;
   double *R;
   double *A;
-  StaticLink **_links;
+  int *exemplar;
+  int *clusters;
+  unsigned int ncluster;
 } AffinityPropagation;
 
 /**
@@ -198,7 +118,13 @@ double median(const double *vector, unsigned int ntotal) {
 
 /**
  * @function AffinityPropagation_init
+ * Initialize a new affinity propagation task.
  *
+ * @param S           the similarity matrix.
+ * @param N           the number of data points.
+ * @param maxiter     the number of maximum iterations.
+ * @param preference  the initial preferences for the data points.
+ * @param verbose     if true, some internal logs will be printed.
  */
 AffinityPropagation *
 AffinityPropagation_init(const double *S, const unsigned int N,
@@ -230,7 +156,7 @@ AffinityPropagation_init(const double *S, const unsigned int N,
   ap->_al_s_sorted = NULL;
   ap->_r_upper = NULL;
   ap->_s_sorted = NULL;
-  ap->_links = NULL;
+  ap->_edges = NULL;
 
   if (preference) {
     memcpy(ap->preference, preference, sizeof(double) * N);
@@ -281,6 +207,15 @@ void AffinityPropagation_free(AffinityPropagation *ap) {
   if (ap->preference) {
     free(ap->preference);
   }
+  if (ap->clusters) {
+    free(ap->clusters);
+  }
+  if (ap->_edges) {
+    free(ap->_edges);
+  }
+  if (ap->exemplar) {
+    free(ap->exemplar);
+  }
   free(ap);
 };
 
@@ -291,6 +226,9 @@ void AffinityPropagation_free(AffinityPropagation *ap) {
  * @see equation (5)
  */
 void availability_lower(AffinityPropagation *ap) {
+
+  clock_t tic = clock();
+
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_a_lower, N2, double);
 
@@ -310,7 +248,8 @@ void availability_lower(AffinityPropagation *ap) {
   // Set the a_lower for all i,j pairs.
   for (int j = 0; j < ap->N; j++) {
     int jj = j * ap->N + j;
-    double a_ij = dcmp(ap->R[jj], 0.0) <= 0 ? ap->R[jj] : 0.0;
+    double a_ij = dmin(0.0, ap->R[jj]);
+
     for (int i = 0; i < ap->N; i++) {
       int ij = i * ap->N + j;
       if (i == j) {
@@ -320,6 +259,13 @@ void availability_lower(AffinityPropagation *ap) {
       }
     }
   }
+
+  for (int i = 0; i < ap->N; i++) {
+    ap->R[i * ap->N + i] = 0.0;
+  }
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
@@ -329,6 +275,8 @@ void availability_lower(AffinityPropagation *ap) {
  * @see equation (6)
  */
 void responsibility_upper(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_r_upper, N2, double);
 
@@ -361,6 +309,8 @@ void responsibility_upper(AffinityPropagation *ap) {
       ij++;
     }
   }
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
@@ -370,8 +320,12 @@ void responsibility_upper(AffinityPropagation *ap) {
  * @see equation (7)
  */
 void availability_upper(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_a_upper, N2, double);
+  
+  
 
   for (int j = 0; j < ap->N; j++) {
     int jj = j * ap->N + j;
@@ -387,24 +341,19 @@ void availability_upper(AffinityPropagation *ap) {
         }
         int kj = k * ap->N + j;
         double r_kj = ap->_r_upper[kj];
-        sum += dcmp(r_kj, 0.0) == 1 ? r_kj : 0.0;
+        sum += dmax(r_kj, 0.0);
       }
 
       if (i == j) {
-#warning Is this right?
-        // au_[i,j] = \sum_{k != i}{ max{0, ru_[k,j]} }
-        sum -= dcmp(r_jj, 0.0) > 0 ? r_jj : 0.0;
         ap->_a_upper[ij] = sum;
       } else {
-        // au_[i,j] = \min{
-        //    0.0,
-        //    ru_[j,j] + \sum_{k != i}{ max{0, ru_[k,j]} } - max{0, ru_[j,j]}
-        // }
-        sum += r_jj - dcmp(r_jj, 0.0) > 0 ? r_jj : 0.0;
-        ap->_a_upper[ij] = dcmp(sum, 0.0) < 0 ? sum : 0.0;
+        ap->_a_upper[ij] = dmin(0.0, r_jj + sum - dmax(0.0, r_jj));
       }
     }
   }
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
@@ -413,6 +362,8 @@ void availability_upper(AffinityPropagation *ap) {
  * matrix.
  */
 void similarity_sort(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_s_sorted, N2, double);
   memcpy(ap->_s_sorted, ap->similarity, sizeof(double) * N2);
@@ -420,6 +371,9 @@ void similarity_sort(AffinityPropagation *ap) {
     int i0 = i * ap->N;
     qsort(&ap->_s_sorted[i0], ap->N, sizeof(double), dcmp_sort_des);
   }
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
@@ -430,10 +384,14 @@ void similarity_sort(AffinityPropagation *ap) {
  * @see Algorithm 1, line 1-3
  */
 void AffinityPropagation_initBound(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
   similarity_sort(ap);
   availability_lower(ap);
   responsibility_upper(ap);
   availability_upper(ap);
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
@@ -448,17 +406,21 @@ void AffinityPropagation_initBound(AffinityPropagation *ap) {
  * @see Algorithm 1, line 4 - 8
  */
 void AffinityPropagation_link(AffinityPropagation *ap) {
+  clock_t tic = clock();
 
-  ALLOCATE(ap->_links, ap->N, StaticLink *);
-  for (int i = 0; i < ap->N; i++) {
-    ap->_links[i] = NULL;
+  unsigned int N2 = ap->N * ap->N;
+  ALLOCATE(ap->_edges, N2, bool);
+  for (int i = 0; i < N2; i++) {
+    ap->_edges[i] = false;
   }
 
   for (int i = 0; i < ap->N; i++) {
+
     int i0 = i * ap->N;
 
     for (int j = i + 1; j < ap->N; j++) {
       int ij = i * ap->N + j;
+      int ji = j * ap->N + i;
 
       double au_ij = ap->_a_upper[ij];
       double s_ij = ap->similarity[ij];
@@ -470,23 +432,27 @@ void AffinityPropagation_link(AffinityPropagation *ap) {
       }
 
       if (dcmp(ap->_r_upper[ij], 0.0) >= 0 || dcmp(au_ij + s_ij, alsmax) >= 0) {
-        if (ap->_links[i] == NULL) {
-          ap->_links[i] = StaticLink_init(i, NULL, 0);
-        }
-        StaticLink_addEdge(ap->_links[i], j);
+        ap->_edges[ij] = true;
+        ap->_edges[ji] = true;
       }
     }
   }
-  for (int i = 0; i < ap->N; i++) {
-    if (ap->_links[i] == NULL) {
-      continue;
+
+  if (ap->verbose) {
+    int density = 0;
+    for (int i = 0; i < N2; i++) {
+      density += ap->_edges[i] ? 1 : 0;
     }
-    StaticLink_finalize(ap->_links[i]);
+    printf("Graph Sparseness: %.4f\n",
+           1.0 - (double)((int)N2 - density) / (double)N2);
   }
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
 
 /**
- * @function AffinityPropagation_update
+ * @function AffinityPropagation_update_linked
  * Update each linked data pair iteratively with equation (1):
  *
  *  r_{i,j} = (1 - \lambda)\rho_{i,j}   + \lambda r_{i,j}
@@ -494,7 +460,8 @@ void AffinityPropagation_link(AffinityPropagation *ap) {
  *
  * @see Algorithm 1, line 9 - 13
  */
-void AffinityPropagation_update(AffinityPropagation *ap) {
+void AffinityPropagation_update_linked(AffinityPropagation *ap) {
+  clock_t tic = clock();
 
   unsigned int iter = 0;
   unsigned int N2 = ap->N * ap->N;
@@ -502,9 +469,11 @@ void AffinityPropagation_update(AffinityPropagation *ap) {
   double *rho = NULL;
   double *alp = NULL;
   double *mat = NULL;
+  double *max = NULL;
   ALLOCATE(rho, N2, double);
   ALLOCATE(alp, N2, double);
   ALLOCATE(mat, N2, double);
+  ALLOCATE(max, ap->N * 2, double);
 
   while (iter < ap->maxiter) {
 
@@ -512,29 +481,34 @@ void AffinityPropagation_update(AffinityPropagation *ap) {
     cblas_dcopy(N2, ap->similarity, 1, mat, 1);
     cblas_daxpy(N2, 1.0, ap->A, 1, mat, 1);
 
-    // Sort each row of the matrix
+    // Find the first and second largest values of each row
     for (int i = 0; i < ap->N; i++) {
-      qsort(&mat[i * ap->N], ap->N, sizeof(double), dcmp_sort_des);
+      int i0 = i * ap->N;
+      CBLAS_INDEX imax1 = cblas_idamax(ap->N, &mat[i0], 1);
+      max[i * 2 + 0] = mat[i0 + imax1];
+      mat[i0 + imax1] = -FLT_MAX;
+      CBLAS_INDEX imax2 = cblas_idamax(ap->N, &mat[i0], 1);
+      max[i * 2 + 1] = mat[i0 + imax2];
+      mat[i0 + imax1] = max[i * 2 + 0];
     }
 
     // Update the responsibility and availability for each linked data point
     // pair [i,j].
     for (int i = 0; i < ap->N; i++) {
-      StaticLink *link = ap->_links[i];
-      if (link == NULL) {
-        continue;
-      }
 
       int i0 = i * ap->N;
 
-      for (int idx = 0; idx < link->count; idx++) {
-        int j = link->edge[idx];
+      for (int j = 0; j < ap->N; j++) {
+        if (ap->_edges[j] == false) {
+          continue;
+        }
+
         int ij = i * ap->N + j;
         int jj = j * ap->N + j;
 
-        double v = mat[i0];
+        double v = max[i0];
         if (dcmp(v, ap->A[ij]) == 0) {
-          v = mat[i0 + 1];
+          v = max[i0 + 1];
         }
         rho[ij] = ap->similarity[ij] - v;
 
@@ -561,17 +535,239 @@ void AffinityPropagation_update(AffinityPropagation *ap) {
 
     cblas_dscal(N2, ap->damping, ap->A, 1);
     cblas_daxpy(N2, 1.0 - ap->damping, alp, 1, ap->A, 1);
+
+    iter++;
+    printf("Iteration %d finished!\n", iter);
   }
 
+  free(max);
   free(alp);
   free(rho);
   free(mat);
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
+}
+
+const double *AffinityPropagation_RA(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
+  unsigned int N2 = ap->N * ap->N;
+  double *RA = NULL;
+  ALLOCATE(RA, N2, double);
+  cblas_dcopy(N2, ap->R, 1, RA, 1);
+  cblas_daxpy(N2, 1.0, ap->A, 1, RA, 1);
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
+  return RA;
+}
+
+/**
+ * @function AffinityPropagation_compute_unlinked
+ * Compute the responsibility and availability for each unlinked data points
+ * pairs. This function will be executed only once.
+ *
+ * @param RA  the matrix sum of the responsibility matrix and the availability
+ *            matrix.
+ *
+ * @see Algorithm 1, line 14-16
+ */
+void AffinityPropagation_compute_unlinked(AffinityPropagation *ap,
+                                          const double *RA) {
+  clock_t tic = clock();
+
+  for (int i = 0; i < ap->N; i++) {
+    int i0 = i * ap->N;
+
+    for (int j = 0; j < ap->N; j++) {
+      int ij = i0 + j;
+      if (ap->_edges[ij]) {
+        continue;
+      }
+      int jj = j * ap->N + j;
+
+      double v = RA[i0];
+      if (dcmp(v, ap->A[ij]) == 0) {
+        v = RA[i0 + 1];
+      }
+      ap->R[ij] = ap->similarity[ij] - v;
+
+      v = 0.0;
+      for (int k = 0; k < ap->N; k++) {
+        if (k == i) {
+          continue;
+        }
+        int kj = k * ap->N + j;
+        double rkj = ap->R[kj];
+        v += dmax(rkj, 0.0);
+      }
+
+      if (i == j) {
+        ap->A[ij] = v;
+      } else {
+        ap->A[ij] = dmin(0.0, v - dmax(0., ap->R[jj]));
+      }
+    }
+  }
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
+}
+
+/**
+ * @function AffinityPropagation_exemplar
+ * Compute the exemplar and the connections.
+ *
+ * @see Algorithm 1, line 17-19
+ */
+void AffinityPropagation_exemplar(AffinityPropagation *ap, const double *RA) {
+  clock_t tic = clock();
+
+  ALLOCATE(ap->exemplar, ap->N, int);
+  ALLOCATE(ap->clusters, ap->N, int);
+
+  int counter = 0;
+  for (int i = 0; i < ap->N; i++) {
+    int exemplar = cblas_idamax(ap->N, &RA[i * ap->N], 1);
+    bool flag = true;
+    for (int j = 0; j < counter; j++) {
+      if (ap->clusters[j] == exemplar) {
+        flag = false;
+        continue;
+      }
+    }
+    if (flag) {
+      ap->clusters[counter] = exemplar;
+      counter++;
+    }
+  }
+
+  ap->clusters = realloc(ap->clusters, counter);
+  ap->ncluster = counter;
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
+}
+
+double *pairwise_distance_matrix(double *points, int npoint, int dim,
+                                 bool squared) {
+  unsigned int N2 = npoint * npoint;
+  double *dist = NULL;
+  ALLOCATE(dist, N2, double);
+
+  double *vec = NULL;
+  ALLOCATE(vec, dim, double);
+  double root = 2.0;
+
+  for (int i = 0; i < npoint; i++) {
+    double *pi = &points[i * dim];
+    for (int j = i + 1; j < npoint; j++) {
+      int ij = i * npoint + j;
+      int ji = j * npoint + i;
+      double *pj = &points[j * dim];
+      memcpy(vec, pj, sizeof(double) * dim);
+
+      cblas_daxpy(dim, -1.0, pi, 1, vec, 1);
+      vvpows(vec, &root, vec, &dim);
+
+      double d = cblas_dasum(dim, vec, 1);
+      dist[ij] = d;
+      dist[ji] = d;
+    }
+  }
+  if (squared == false) {
+    vvsqrt(dist, dist, (const int *)&N2);
+  }
+  return dist;
+}
+
+void AffinityPropagation_fit(AffinityPropagation *ap) {
+  clock_t tic = clock();
+
+  unsigned int N2 = ap->N * ap->N;
+  ALLOCATE(ap->R, N2, double);
+  ALLOCATE(ap->A, N2, double);
+
+  AffinityPropagation_initBound(ap);
+  AffinityPropagation_link(ap);
+  AffinityPropagation_update_linked(ap);
+
+  const double *RA = AffinityPropagation_RA(ap);
+  AffinityPropagation_compute_unlinked(ap, RA);
+  AffinityPropagation_exemplar(ap, RA);
+  free((double *)RA);
+
+  double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
+  printf("Routine: %50s | time: %.3f\n", __func__, time);
+}
+
+double *Matrix_load(const char *filename, unsigned int row, unsigned int col) {
+  FILE *F = fopen(filename, "r");
+  if (F == NULL) {
+    return NULL;
+  }
+
+  double *X = NULL;
+  ALLOCATE(X, row * col, double);
+
+  char buf[128];
+  int k = 0;
+  int n = row * col;
+  while (fgets(buf, sizeof(buf), F) != NULL) {
+    sscanf(buf, "%lf", &X[k]);
+    k++;
+    if (n == k) {
+      break;
+    }
+  }
+
+  return X;
 }
 
 int main(int argc, const char *argv[]) {
 
-  double *p = NULL;
-  ALLOCATE(p, 5, double);
+  //  FILE *fp = fopen(
+  //      "/Users/bismarrck/Documents/Project/FastAffinityPropagation/data.txt",
+  //      "r");
+  //
+  //  if (fp == NULL) {
+  //    abort();
+  //  }
+  //
+  //  int nrow = 1500;
+  //  int ncol = 2;
+  //
+  //  char line[1024];
+  //  double x = 0.0;
+  //  double y = 0.0;
+  //  int label = 0;
+  //
+  //  double *matrix = calloc(sizeof(double), nrow * ncol);
+  //  int *true_labels = calloc(sizeof(int), nrow);
+  //
+  //  int k = 0;
+  //  while (fgets(line, sizeof(line), fp) != NULL) {
+  //    int n = sscanf(line, "%lf %lf %d", &x, &y, &label);
+  //    if (n == 3) {
+  //      matrix[k * 2 + 0] = x;
+  //      matrix[k * 2 + 1] = y;
+  //      true_labels[k] = label;
+  //      k++;
+  //    }
+  //  }
+  //  assert(k == nrow);
+  //  fclose(fp);
+  //
+  //  double *S = pairwise_distance_matrix(matrix, nrow, 2, true);
+  double *S = Matrix_load(
+      "/Users/bismarrck/Documents/Project/FastAffinityPropagation/data.txt",
+      1500, 1500);
 
+  AffinityPropagation *ap = AffinityPropagation_init(S, 1500, 5, 5, NULL, true);
+  AffinityPropagation_fit(ap);
+  AffinityPropagation_free(ap);
+
+  free(S);
   return 0;
 }
