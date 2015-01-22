@@ -82,9 +82,9 @@ typedef struct {
   double damping;
   unsigned int ncheck;
   bool verbose;
-  double *_a_upper;
-  double *_a_lower;
-  double *_r_upper;
+  double *_Au;
+  double *_Al;
+  double *_Ru;
   double *_s_sorted;
   double *_al_s_sorted;
   bool *_edges;
@@ -151,10 +151,10 @@ AffinityPropagation_init(const double *S, const unsigned int N,
   ap->maxiter = maxiter;
   ap->preference = calloc(sizeof(double), N);
   ap->verbose = verbose;
-  ap->_a_lower = NULL;
-  ap->_a_upper = NULL;
+  ap->_Al = NULL;
+  ap->_Au = NULL;
   ap->_al_s_sorted = NULL;
-  ap->_r_upper = NULL;
+  ap->_Ru = NULL;
   ap->_s_sorted = NULL;
   ap->_edges = NULL;
 
@@ -186,14 +186,14 @@ void AffinityPropagation_free(AffinityPropagation *ap) {
   if (ap->_s_sorted) {
     free(ap->_s_sorted);
   }
-  if (ap->_r_upper) {
-    free(ap->_r_upper);
+  if (ap->_Ru) {
+    free(ap->_Ru);
   }
-  if (ap->_a_upper) {
-    free(ap->_a_upper);
+  if (ap->_Au) {
+    free(ap->_Au);
   }
-  if (ap->_a_lower) {
-    free(ap->_a_lower);
+  if (ap->_Al) {
+    free(ap->_Al);
   }
   if (ap->A) {
     free(ap->A);
@@ -230,7 +230,7 @@ void availability_lower(AffinityPropagation *ap) {
   clock_t tic = clock();
 
   unsigned int N2 = ap->N * ap->N;
-  ALLOCATE(ap->_a_lower, N2, double);
+  ALLOCATE(ap->_Al, N2, double);
 
   // Compute the initial $r_{jj}$:
   // r[j,j] = s[j,j] - max{ s[j,k], j != k }
@@ -253,9 +253,9 @@ void availability_lower(AffinityPropagation *ap) {
     for (int i = 0; i < ap->N; i++) {
       int ij = i * ap->N + j;
       if (i == j) {
-        ap->_a_lower[ij] = 0.0;
+        ap->_Al[ij] = 0.0;
       } else {
-        ap->_a_lower[ij] = a_ij;
+        ap->_Al[ij] = a_ij;
       }
     }
   }
@@ -278,37 +278,44 @@ void responsibility_upper(AffinityPropagation *ap) {
   clock_t tic = clock();
 
   unsigned int N2 = ap->N * ap->N;
-  ALLOCATE(ap->_r_upper, N2, double);
 
-  // Compute the a_[i,k] + s[i,k]
-  ALLOCATE(ap->_al_s_sorted, N2, double);
-  cblas_dcopy(N2, ap->_a_lower, 1, ap->_al_s_sorted, 1);
-  cblas_daxpy(N2, 1.0, ap->similarity, 1, ap->_al_s_sorted, 1);
+  double *AS = calloc(sizeof(double), N2);
+  cblas_dcopy(N2, ap->similarity, 1, AS, 1);
+  cblas_daxpy(N2, 1.0, ap->_Al, 1, AS, 1);
 
-  // Sort the each row of as.
+  ALLOCATE(ap->_Ru, N2, double);
+  cblas_dcopy(N2, ap->similarity, 1, ap->_Ru, 1);
+
+  int *I = calloc(sizeof(int), ap->N);
+  double *Y = calloc(sizeof(double), ap->N);
+  double *Y2 = calloc(sizeof(double), ap->N);
+
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
-    qsort(&ap->_al_s_sorted[i0], ap->N, sizeof(double), dcmp_sort_des);
+    CBLAS_INDEX i1 = cblas_idamax(ap->N, &AS[i0], 1);
+    I[i] = i1;
+    Y[i] = AS[i0 + i1];
+
+    AS[i0 + i1] = -FLT_MAX;
+    CBLAS_INDEX i2 = cblas_idamax(ap->N, &AS[i0], 1);
+    Y2[i] = AS[i0 + i2];
+
+    AS[i0 + i1] = Y[i];
   }
 
-  int ij = 0;
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
     for (int j = 0; j < ap->N; j++) {
-      double sub = 0.0;
-      if (i == j) {
-        sub = ap->_s_sorted[i0];
-      } else {
-        if (dcmp(ap->_al_s_sorted[ij], ap->_al_s_sorted[i0]) == 0) {
-          sub = ap->_al_s_sorted[i0 + 1];
-        } else {
-          sub = ap->_al_s_sorted[i0];
-        }
-      }
-      ap->_r_upper[ij] = ap->similarity[ij] - sub;
-      ij++;
+      ap->_Ru[i0 + j] -= Y[i];
     }
+    ap->_Ru[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
   }
+
+  free(I);
+  free(Y);
+  free(Y2);
+  free(AS);
+
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %.3f\n", __func__, time);
 }
@@ -323,34 +330,46 @@ void availability_upper(AffinityPropagation *ap) {
   clock_t tic = clock();
 
   unsigned int N2 = ap->N * ap->N;
-  ALLOCATE(ap->_a_upper, N2, double);
-  
-  
+  ALLOCATE(ap->_Au, N2, double);
 
-  for (int j = 0; j < ap->N; j++) {
-    int jj = j * ap->N + j;
-    double r_jj = ap->_r_upper[jj];
-
-    for (int i = 0; i < ap->N; i++) {
-      // sum = \sum_{k != i}{ \max{ 0, ru_[k,j] } }
-      double sum = 0.0;
-      int ij = i * ap->N + j;
-      for (int k = 0; k < ap->N; k++) {
-        if (k == i) {
-          continue;
-        }
-        int kj = k * ap->N + j;
-        double r_kj = ap->_r_upper[kj];
-        sum += dmax(r_kj, 0.0);
-      }
-
+  double *Rp = calloc(sizeof(double), N2);
+  double *Rs = calloc(sizeof(double), ap->N);
+  int k = 0;
+  for (int i = 0; i < ap->N; i++) {
+    for (int j = 0; j < ap->N; j++) {
       if (i == j) {
-        ap->_a_upper[ij] = sum;
+        Rp[k] = ap->_Ru[k];
       } else {
-        ap->_a_upper[ij] = dmin(0.0, r_jj + sum - dmax(0.0, r_jj));
+        Rp[k] = dmax(ap->_Ru[k], 0.0);
+      }
+      Rs[j] += Rp[k];
+      k++;
+    }
+  }
+
+  cblas_dcopy(N2, Rp, 1, ap->_Au, 1);
+  double *dA = calloc(sizeof(double), ap->N);
+  for (int i = 0; i < ap->N; i++) {
+    int i0 = i * ap->N;
+    catlas_daxpby(ap->N, 1.0, Rs, 1, -1.0, &ap->_Au[i0], 1);
+    int ii = i0 + i;
+    dA[i] = ap->_Au[ii];
+  }
+
+  k = 0;
+  for (int i = 0; i < ap->N; i++) {
+    for (int j = 0; j < ap->N; j++) {
+      if (i == j) {
+        ap->_Au[k] = dA[i];
+      } else {
+        ap->_Au[k] = dmin(0.0, ap->_Au[k]);
       }
     }
   }
+
+  free(dA);
+  free(Rs);
+  free(Rp);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %.3f\n", __func__, time);
@@ -422,16 +441,16 @@ void AffinityPropagation_link(AffinityPropagation *ap) {
       int ij = i * ap->N + j;
       int ji = j * ap->N + i;
 
-      double au_ij = ap->_a_upper[ij];
+      double au_ij = ap->_Au[ij];
       double s_ij = ap->similarity[ij];
-      double al_ij = ap->_a_lower[ij];
+      double al_ij = ap->_Al[ij];
       double alsmax = ap->_al_s_sorted[i0];
 
       if (dcmp(alsmax, al_ij + s_ij) == 0) {
         alsmax = ap->_al_s_sorted[i0 + 1];
       }
 
-      if (dcmp(ap->_r_upper[ij], 0.0) >= 0 || dcmp(au_ij + s_ij, alsmax) >= 0) {
+      if (dcmp(ap->_Ru[ij], 0.0) >= 0 || dcmp(au_ij + s_ij, alsmax) >= 0) {
         ap->_edges[ij] = true;
         ap->_edges[ji] = true;
       }
