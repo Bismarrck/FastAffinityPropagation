@@ -137,8 +137,6 @@ typedef struct {
   double *_Au;
   double *_Al;
   double *_Ru;
-  double *_s_sorted;
-  double *_al_s_sorted;
   bool *_edges;
   double *R;
   double *A;
@@ -208,7 +206,6 @@ AffinityPropagation_init(const double *S, const unsigned int N,
   ap->_Ru = NULL;
   ap->exemplar = NULL;
   ap->clusters = NULL;
-  ap->_s_sorted = NULL;
   ap->_edges = NULL;
 
   if (preference) {
@@ -232,7 +229,6 @@ void AffinityPropagation_free(AffinityPropagation *ap) {
     return;
   }
 
-  DEALLOCATE(ap->_s_sorted);
   DEALLOCATE(ap->_Ru);
   DEALLOCATE(ap->_Au);
   DEALLOCATE(ap->_Al);
@@ -259,19 +255,6 @@ void availability_lower(AffinityPropagation *ap) {
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_Al, N2, double);
 
-  // Compute the initial $r_{jj}$:
-  // r[j,j] = s[j,j] - max{ s[j,k], j != k }
-  for (int j = 0; j < ap->N; j++) {
-    int j0 = j * ap->N;
-    int jj = j * ap->N + j;
-    ap->R[jj] = ap->similarity[jj];
-    if (dcmp(ap->_s_sorted[j0], ap->similarity[jj]) == 0) {
-      ap->R[jj] -= ap->_s_sorted[j0 + 1];
-    } else {
-      ap->R[jj] -= ap->_s_sorted[j0 + 0];
-    }
-  }
-
   // Set the a_lower for all i,j pairs.
   for (int j = 0; j < ap->N; j++) {
     int jj = j * ap->N + j;
@@ -285,10 +268,6 @@ void availability_lower(AffinityPropagation *ap) {
         ap->_Al[ij] = a_ij;
       }
     }
-  }
-
-  for (int i = 0; i < ap->N; i++) {
-    ap->R[i * ap->N + i] = 0.0;
   }
 
 #if defined(DEBUG)
@@ -425,20 +404,37 @@ void availability_upper(AffinityPropagation *ap) {
 }
 
 /**
- * @function similarity_sort
- * This function sorts the similarity matrix row-by-row. _s_sorted is the sorted
- * matrix.
+ * @function responsibility_init
+ * Compute the initial responsibility for all data points pairs.
  */
-void similarity_sort(AffinityPropagation *ap) {
+void responsibility_init(AffinityPropagation *ap) {
   clock_t tic = clock();
 
-  unsigned int N2 = ap->N * ap->N;
-  ALLOCATE(ap->_s_sorted, N2, double);
-  memcpy(ap->_s_sorted, ap->similarity, sizeof(double) * N2);
+  double *Y1, *Y2;
+  int *I;
+  ALLOCATE(Y1, ap->N, double);
+  ALLOCATE(Y2, ap->N, double);
+  ALLOCATE(I, ap->N, int);
+
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
-    qsort(&ap->_s_sorted[i0], ap->N, sizeof(double), dcmp_sort_des);
+    Y1[i] = vdmax(&ap->similarity[i0], ap->N, &I[i]);
+    ap->similarity[i0 + I[i]] = -FLT_MAX;
+    Y2[i] = vdmax(&ap->similarity[i0], ap->N, NULL);
+    ap->similarity[i0 + I[i]] = Y1[i];
   }
+
+  for (int i = 0; i < ap->N; i++) {
+    int i0 = i * ap->N;
+    for (int j = 0; j < ap->N; j++) {
+      ap->R[i0 + j] = ap->similarity[i0 + j] - Y1[i];
+    }
+    ap->R[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
+  }
+
+  DEALLOCATE(Y1);
+  DEALLOCATE(Y2);
+  DEALLOCATE(I);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -454,7 +450,7 @@ void similarity_sort(AffinityPropagation *ap) {
 void AffinityPropagation_initBound(AffinityPropagation *ap) {
   clock_t tic = clock();
 
-  similarity_sort(ap);
+  responsibility_init(ap);
   availability_lower(ap);
   responsibility_upper(ap);
   availability_upper(ap);
