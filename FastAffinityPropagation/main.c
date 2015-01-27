@@ -12,10 +12,19 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <float.h>
 #include <Accelerate/Accelerate.h>
 #include "utarray.h"
 
+#ifndef DEBUG
+#define DEBUG
+#endif
+
 #define ALLOCATE(p, n, type) (p = calloc(sizeof(type), n));
+#define DEALLOCATE(p)                                                          \
+  if (p != NULL) {                                                             \
+    free(p);                                                                   \
+  }
 
 /**
  * @function dcmp
@@ -33,6 +42,10 @@ static int dcmp(double d1, double d2) {
   }
 }
 
+/**
+ * @function dmax
+ * Return the larger one given two double precision floats.
+ */
 static double dmax(double d1, double d2) {
   int vs = dcmp(d1, d2);
   if (vs >= 0) {
@@ -42,6 +55,10 @@ static double dmax(double d1, double d2) {
   }
 }
 
+/**
+ * @function dmin
+ * Return the smaller one given two double precision floats.
+ */
 static double dmin(double d1, double d2) {
   int vs = dcmp(d1, d2);
   if (vs <= 0) {
@@ -49,6 +66,46 @@ static double dmin(double d1, double d2) {
   } else {
     return d2;
   }
+}
+
+/**
+ * @function vdmax
+ * Return the maximum and the position of the maximum given a double precision
+ * vector.
+ */
+static double vdmax(double *restrict v, const int n, int *i) {
+  int k = 0;
+  double maximum = -FLT_MAX;
+  while (k < n) {
+    if (dcmp(maximum, v[k]) < 0) {
+      maximum = v[k];
+      if (i) {
+        *i = k;
+      }
+    }
+    k++;
+  }
+  return maximum;
+}
+
+/**
+ * @function vdmax
+ * Return the minimum and the position of the minimum given a double precision
+ * vector.
+ */
+static double vdmin(double *restrict v, const int n, int *i) {
+  int k = 0;
+  double minimum = FLT_MAX;
+  while (k < n) {
+    if (dcmp(minimum, v[k]) > 0) {
+      minimum = v[k];
+      if (i) {
+        *i = k;
+      }
+    }
+    k++;
+  }
+  return minimum;
 }
 
 /**
@@ -148,8 +205,9 @@ AffinityPropagation_init(const double *S, const unsigned int N,
   ap->verbose = verbose;
   ap->_Al = NULL;
   ap->_Au = NULL;
-  ap->_al_s_sorted = NULL;
   ap->_Ru = NULL;
+  ap->exemplar = NULL;
+  ap->clusters = NULL;
   ap->_s_sorted = NULL;
   ap->_edges = NULL;
 
@@ -174,44 +232,18 @@ void AffinityPropagation_free(AffinityPropagation *ap) {
     return;
   }
 
-  if (ap->_al_s_sorted) {
-    free(ap->_al_s_sorted);
-  }
-
-  if (ap->_s_sorted) {
-    free(ap->_s_sorted);
-  }
-  if (ap->_Ru) {
-    free(ap->_Ru);
-  }
-  if (ap->_Au) {
-    free(ap->_Au);
-  }
-  if (ap->_Al) {
-    free(ap->_Al);
-  }
-  if (ap->A) {
-    free(ap->A);
-  }
-  if (ap->R) {
-    free(ap->R);
-  }
-  if (ap->similarity) {
-    free(ap->similarity);
-  }
-  if (ap->preference) {
-    free(ap->preference);
-  }
-  if (ap->clusters) {
-    free(ap->clusters);
-  }
-  if (ap->_edges) {
-    free(ap->_edges);
-  }
-  if (ap->exemplar) {
-    free(ap->exemplar);
-  }
-  free(ap);
+  DEALLOCATE(ap->_s_sorted);
+  DEALLOCATE(ap->_Ru);
+  DEALLOCATE(ap->_Au);
+  DEALLOCATE(ap->_Al);
+  DEALLOCATE(ap->_edges)
+  DEALLOCATE(ap->A);
+  DEALLOCATE(ap->R);
+  DEALLOCATE(ap->similarity);
+  DEALLOCATE(ap->preference);
+  DEALLOCATE(ap->clusters);
+  DEALLOCATE(ap->exemplar);
+  DEALLOCATE(ap);
 };
 
 /**
@@ -259,6 +291,12 @@ void availability_lower(AffinityPropagation *ap) {
     ap->R[i * ap->N + i] = 0.0;
   }
 
+#if defined(DEBUG)
+  double rmin = vdmin(ap->_Al, N2, NULL);
+  double rmax = vdmax(ap->_Al, N2, NULL);
+  printf("availability_lower range  : [%.2f, %.2f]\n", rmin, rmax);
+#endif
+
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
 }
@@ -289,15 +327,17 @@ void responsibility_upper(AffinityPropagation *ap) {
 
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
-    CBLAS_INDEX i1 = cblas_idamax(ap->N, &AS[i0], 1);
-    I[i] = i1;
-    Y1[i] = AS[i0 + i1];
 
-    AS[i0 + i1] = -FLT_MAX;
-    CBLAS_INDEX i2 = cblas_idamax(ap->N, &AS[i0], 1);
-    Y2[i] = AS[i0 + i2];
+    // Find the largest value for each row.
+    Y1[i] = vdmax(&AS[i0], ap->N, &I[i]);
 
-    AS[i0 + i1] = Y1[i];
+    // Set the largest value to -infinity and find the second largest value for
+    // each row.
+    AS[i0 + I[i]] = -FLT_MAX;
+    Y2[i] = vdmax(&AS[i0], ap->N, NULL);
+
+    // Restore the default value.
+    AS[i0 + I[i]] = Y1[i];
   }
 
   for (int i = 0; i < ap->N; i++) {
@@ -308,10 +348,16 @@ void responsibility_upper(AffinityPropagation *ap) {
     ap->_Ru[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
   }
 
-  free(I);
-  free(Y1);
-  free(Y2);
-  free(AS);
+  DEALLOCATE(I);
+  DEALLOCATE(Y1);
+  DEALLOCATE(Y2);
+  DEALLOCATE(AS);
+
+#if defined(DEBUG)
+  double rmin = vdmin(ap->_Ru, N2, NULL);
+  double rmax = vdmax(ap->_Ru, N2, NULL);
+  printf("responsibility_upper range: [%.2f, %.2f]\n", rmin, rmax);
+#endif
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -364,9 +410,15 @@ void availability_upper(AffinityPropagation *ap) {
     }
   }
 
-  free(dA);
-  free(Rs);
-  free(Rp);
+  DEALLOCATE(dA);
+  DEALLOCATE(Rs);
+  DEALLOCATE(Rp);
+
+#if defined(DEBUG)
+  double rmin = vdmin(ap->_Au, N2, NULL);
+  double rmax = vdmax(ap->_Au, N2, NULL);
+  printf("availability_upper range  : [%.2f, %.2f]\n", rmin, rmax);
+#endif
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -493,15 +545,11 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
     // Y1 and Y2 are the first and second largest values for each row in AS.
     for (int i = 0; i < ap->N; i++) {
       int i0 = i * ap->N;
-      CBLAS_INDEX i1 = cblas_idamax(ap->N, &AS[i0], 1);
-      I[i] = i1;
-      Y1[i] = AS[i0 + i1];
 
-      AS[i0 + i1] = -FLT_MAX;
-      CBLAS_INDEX i2 = cblas_idamax(ap->N, &AS[i0], 1);
-      Y2[i] = AS[i0 + i2];
-
-      AS[i0 + i1] = Y1[i];
+      Y1[i] = vdmax(&AS[i0], ap->N, &I[i]);
+      AS[i0 + I[i]] = -FLT_MAX;
+      Y2[i] = vdmax(&AS[i0], ap->N, NULL);
+      AS[i0 + I[i]] = Y1[i];
     }
 
     // Update the responsibility of the linked data point pairs.
@@ -569,9 +617,16 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
     printf("Iteration %d finished!\n", iter);
   }
 
-  free(max);
-  free(alp);
-  free(rho);
+  DEALLOCATE(rho);
+  DEALLOCATE(alp);
+  DEALLOCATE(AS);
+  DEALLOCATE(max);
+  DEALLOCATE(I);
+  DEALLOCATE(Y1);
+  DEALLOCATE(Y2);
+  DEALLOCATE(Rp);
+  DEALLOCATE(Rs);
+  DEALLOCATE(dA);
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
@@ -657,7 +712,9 @@ void AffinityPropagation_exemplar(AffinityPropagation *ap, const double *RA) {
 
   int counter = 0;
   for (int i = 0; i < ap->N; i++) {
-    int exemplar = cblas_idamax(ap->N, &RA[i * ap->N], 1);
+    int exemplar = 0;
+    vdmax((double *)&RA[i * ap->N], ap->N, &exemplar);
+    ap->exemplar[i] = exemplar;
     bool flag = true;
     for (int j = 0; j < counter; j++) {
       if (ap->clusters[j] == exemplar) {
@@ -712,6 +769,11 @@ double *pairwise_distance_matrix(double *points, int npoint, int dim,
 
 void AffinityPropagation_fit(AffinityPropagation *ap) {
   clock_t tic = clock();
+
+  for (int i = 0; i < ap->N; i++) {
+    int ii = i * ap->N + i;
+    ap->similarity[ii] = ap->preference[i];
+  }
 
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->R, N2, double);
@@ -788,15 +850,40 @@ int main(int argc, const char *argv[]) {
   //  fclose(fp);
   //
   //  double *S = pairwise_distance_matrix(matrix, nrow, 2, true);
+
+  unsigned int dim = 1775;
+
   double *S = Matrix_load(
       "/Users/bismarrck/Documents/Project/FastAffinityPropagation/data.txt",
-      1500, 1500);
+      dim, dim);
+
+  unsigned int maxiter = 100;
+  unsigned int ncheck = 5;
 
   AffinityPropagation *ap =
-      AffinityPropagation_init(S, 1500, 15, 5, NULL, true);
+      AffinityPropagation_init(S, dim, maxiter, ncheck, NULL, true);
   AffinityPropagation_fit(ap);
-  AffinityPropagation_free(ap);
 
+  FILE *fp = fopen(
+      "/Users/bismarrck/Documents/Project/FastAffinityPropagation/label.txt",
+      "r");
+
+  int labels[dim];
+  int k = 0;
+  char buf[256];
+  while (fgets(buf, sizeof(buf), fp) != NULL) {
+    sscanf(buf, "%d\n", &labels[k]);
+    k++;
+  }
+  fclose(fp);
+
+  for (int i = 0; i < dim; i++) {
+    if (labels[i] != ap->exemplar[i]) {
+      printf("%4d | RAW: %3d --> NEW: %3d\n", i, labels[i], ap->exemplar[i]);
+    }
+  }
+
+  AffinityPropagation_free(ap);
   free(S);
   return 0;
 }
