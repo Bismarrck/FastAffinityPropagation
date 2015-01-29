@@ -302,7 +302,6 @@ void responsibility_upper(AffinityPropagation *ap) {
 
   cblas_dcopy(N2, ap->similarity, 1, AS, 1);
   cblas_daxpy(N2, 1.0, ap->_Al, 1, AS, 1);
-  cblas_dcopy(N2, ap->similarity, 1, ap->_Ru, 1);
 
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
@@ -319,10 +318,12 @@ void responsibility_upper(AffinityPropagation *ap) {
     AS[i0 + I[i]] = Y1[i];
   }
 
+  // Since for each i, Al_ii = 0.0, the equation (6) can be written like this:
+  // Ru_ij = S_ij - \max_{k != j}{ Al_ik + S_ik }
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
     for (int j = 0; j < ap->N; j++) {
-      ap->_Ru[i0 + j] -= Y1[i];
+      ap->_Ru[i0 + j] = ap->similarity[i0 + j] - Y1[i];
     }
     ap->_Ru[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
   }
@@ -354,9 +355,16 @@ void availability_upper(AffinityPropagation *ap) {
   unsigned int N2 = ap->N * ap->N;
   ALLOCATE(ap->_Au, N2, double);
 
-  double *Rp = calloc(sizeof(double), N2);
-  double *Rs = calloc(sizeof(double), ap->N);
+  double *Rp, *Rs, *dA;
+  ALLOCATE(Rp, N2, double);
+  ALLOCATE(Rs, ap->N, double);
+  ALLOCATE(dA, ap->N, double);
+
   int k = 0;
+
+  // Rp = [ \max{Ru_ij, 0.0} ] for i,j in [1, N] and the diagonal elements of Rp
+  // are set to Ru_ii because of the Ru_jj term in equation (7).
+  // Rs = Rp.sum(axis=0)
   for (int i = 0; i < ap->N; i++) {
     for (int j = 0; j < ap->N; j++) {
       if (i == j) {
@@ -369,8 +377,9 @@ void availability_upper(AffinityPropagation *ap) {
     }
   }
 
+  // This part computes Rs - Au[i, :] row-by-row which is described by the term:
+  // Ru_jj + \sum_{k != i,j}{ \max{ 0.0, Ru_kj } }
   cblas_dcopy(N2, Rp, 1, ap->_Au, 1);
-  double *dA = calloc(sizeof(double), ap->N);
   for (int i = 0; i < ap->N; i++) {
     int i0 = i * ap->N;
     catlas_daxpby(ap->N, 1.0, Rs, 1, -1.0, &ap->_Au[i0], 1);
@@ -378,6 +387,7 @@ void availability_upper(AffinityPropagation *ap) {
     dA[i] = ap->_Au[ii];
   }
 
+  // This part computes the final availability_upper matrix.
   k = 0;
   for (int i = 0; i < ap->N; i++) {
     for (int j = 0; j < ap->N; j++) {
@@ -386,6 +396,7 @@ void availability_upper(AffinityPropagation *ap) {
       } else {
         ap->_Au[k] = dmin(0.0, ap->_Au[k]);
       }
+      k++;
     }
   }
 
@@ -549,21 +560,18 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
     }
 
     // Update the responsibility of the linked data point pairs.
-    cblas_dcopy(N2, ap->similarity, 1, rho, 1);
-    int k = 0;
     for (int i = 0; i < ap->N; i++) {
       int i0 = i * ap->N;
       for (int j = 0; j < ap->N; j++) {
-        if (ap->_edges[k]) {
-          rho[k] -= Y1[i];
+        if (ap->_edges[i0 + j]) {
+          rho[i0 + j] = ap->similarity[i0 + j] - Y1[i];
         }
-        k++;
       }
       rho[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
     }
 
     // Update the availability of the linked data point pairs.
-    k = 0;
+    int k = 0;
     for (int i = 0; i < ap->N; i++) {
       for (int j = 0; j < ap->N; j++) {
         if (ap->_edges[k]) {
@@ -596,6 +604,7 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
             alp[k] = dmin(0.0, alp[k]);
           }
         }
+        k++;
       }
     }
 
