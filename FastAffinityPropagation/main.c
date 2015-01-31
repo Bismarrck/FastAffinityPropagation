@@ -15,98 +15,13 @@
 #include <float.h>
 #include <Accelerate/Accelerate.h>
 #include "utarray.h"
+#include "clib.h"
+#include "pairwise.h"
+#include "mathlib.h"
 
 #ifndef DEBUG
 #define DEBUG
 #endif
-
-#define ALLOCATE(p, n, type) (p = calloc(sizeof(type), n));
-#define DEALLOCATE(p)                                                          \
-  if (p != NULL) {                                                             \
-    free(p);                                                                   \
-  }
-
-/**
- * @function dcmp
- * This function safely compares two double precision floats and returns 1 if
- * the former is larger, 0 if they are equal or -1 if the former is smaller.
- */
-static int dcmp(double d1, double d2) {
-  double df = d1 - d2;
-  if (df > 1.0e-12) {
-    return 1;
-  } else if (df < -1.0e-12) {
-    return -1;
-  } else {
-    return 0;
-  }
-}
-
-/**
- * @function dmax
- * Return the larger one given two double precision floats.
- */
-static double dmax(double d1, double d2) {
-  int vs = dcmp(d1, d2);
-  if (vs >= 0) {
-    return d1;
-  } else {
-    return d2;
-  }
-}
-
-/**
- * @function dmin
- * Return the smaller one given two double precision floats.
- */
-static double dmin(double d1, double d2) {
-  int vs = dcmp(d1, d2);
-  if (vs <= 0) {
-    return d1;
-  } else {
-    return d2;
-  }
-}
-
-/**
- * @function vdmax
- * Return the maximum and the position of the maximum given a double precision
- * vector.
- */
-static double vdmax(double *restrict v, const int n, int *i) {
-  int k = 0;
-  double maximum = -FLT_MAX;
-  while (k < n) {
-    if (dcmp(maximum, v[k]) < 0) {
-      maximum = v[k];
-      if (i) {
-        *i = k;
-      }
-    }
-    k++;
-  }
-  return maximum;
-}
-
-/**
- * @function vdmin
- * Return the minimum and the position of the minimum given a double precision
- * vector.
- */
-static double vdmin(double *restrict v, const int n, int *i) {
-  int k = 0;
-  double minimum = FLT_MAX;
-  while (k < n) {
-    if (dcmp(minimum, v[k]) > 0) {
-      minimum = v[k];
-      if (i) {
-        *i = k;
-      }
-    }
-    k++;
-  }
-  return minimum;
-}
 
 /**
  * @function dcmp_sort_asc
@@ -446,6 +361,18 @@ void responsibility_init(AffinityPropagation *ap) {
     ap->R[i0 + I[i]] = ap->similarity[i0 + I[i]] - Y2[i];
   }
 
+#if defined(DEBUG)
+
+  double _y1max, _y1min, _y2max, _y2min;
+  _y1max = vdmax(Y1, ap->N, NULL);
+  _y1min = vdmin(Y1, ap->N, NULL);
+  _y2max = vdmax(Y1, ap->N, NULL);
+  _y2min = vdmin(Y1, ap->N, NULL);
+  printf("Y1: [%.3f, %.3f]\n", _y1min, _y1max);
+  printf("Y2: [%.3f, %.3f]\n", _y2min, _y2max);
+
+#endif
+
   DEALLOCATE(Y1);
   DEALLOCATE(Y2);
   DEALLOCATE(I);
@@ -567,18 +494,6 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
       AS[i0 + I[i]] = Y1[i];
     }
 
-#if defined(DEBUG)
-
-    double _y1max, _y1min, _y2max, _y2min;
-    _y1max = vdmax(Y1, ap->N, NULL);
-    _y1min = vdmin(Y1, ap->N, NULL);
-    _y2max = vdmax(Y1, ap->N, NULL);
-    _y2min = vdmin(Y1, ap->N, NULL);
-    printf("Y1: [%.3f, %.3f]\n", _y1min, _y1max);
-    printf("Y2: [%.3f, %.3f]\n", _y2min, _y2max);
-
-#endif
-
     // Update the responsibility of the linked data point pairs.
     for (int i = 0; i < ap->N; i++) {
       int i0 = i * ap->N;
@@ -602,8 +517,8 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
           } else {
             Rp[k] = dmax(ap->R[k], 0.0);
           }
+          Rs[j] += Rp[k];
         }
-        Rs[j] += Rp[k];
         k++;
       }
     }
@@ -638,11 +553,18 @@ void AffinityPropagation_update_linked(AffinityPropagation *ap) {
     catlas_dset(ap->N, 0.0, dA, 1);
     catlas_dset(N2, 0.0, Rp, 1);
 
-    cblas_dscal(N2, ap->damping, ap->R, 1);
-    cblas_daxpy(N2, 1.0 - ap->damping, rho, 1, ap->R, 1);
-
-    cblas_dscal(N2, ap->damping, ap->A, 1);
-    cblas_daxpy(N2, 1.0 - ap->damping, alp, 1, ap->A, 1);
+    // The R and A shall be updated according to the links!
+    k = 0;
+    double minusdamp = 1.0 - ap->damping;
+    for (int i = 0; i < ap->N; i++) {
+      for (int j = 0; j < ap->N; j++) {
+        if (ap->_edges[k]) {
+          ap->R[k] = minusdamp * rho[k] + ap->damping * ap->R[k];
+          ap->A[k] = minusdamp * alp[k] + ap->damping * ap->A[k];
+        }
+        k++;
+      }
+    }
 
     catlas_dset(N2, 0.0, rho, 1);
     catlas_dset(N2, 0.0, alp, 1);
@@ -823,38 +745,6 @@ void AffinityPropagation_exemplar(AffinityPropagation *ap, const double *RA) {
 
   double time = (double)(clock() - tic) / (double)CLOCKS_PER_SEC;
   printf("Routine: %50s | time: %8.3f s\n", __func__, time);
-}
-
-double *pairwise_distance_matrix(double *points, int npoint, int dim,
-                                 bool squared) {
-  unsigned int N2 = npoint * npoint;
-  double *dist = NULL;
-  ALLOCATE(dist, N2, double);
-
-  double *vec = NULL;
-  ALLOCATE(vec, dim, double);
-  double root = 2.0;
-
-  for (int i = 0; i < npoint; i++) {
-    double *pi = &points[i * dim];
-    for (int j = i + 1; j < npoint; j++) {
-      int ij = i * npoint + j;
-      int ji = j * npoint + i;
-      double *pj = &points[j * dim];
-      memcpy(vec, pj, sizeof(double) * dim);
-
-      cblas_daxpy(dim, -1.0, pi, 1, vec, 1);
-      vvpows(vec, &root, vec, &dim);
-
-      double d = cblas_dasum(dim, vec, 1);
-      dist[ij] = d;
-      dist[ji] = d;
-    }
-  }
-  if (squared == false) {
-    vvsqrt(dist, dist, (const int *)&N2);
-  }
-  return dist;
 }
 
 void AffinityPropagation_fit(AffinityPropagation *ap) {
